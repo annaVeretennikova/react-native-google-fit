@@ -32,15 +32,26 @@ import com.google.android.gms.fitness.result.DataReadResult;
 
 import org.json.JSONObject;
 
+import java.sql.Array;
 import java.text.DateFormat;
 import java.text.Format;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+class BMR {
+    public float value;
+    public long timestamp;
+
+    public BMR(float val, long ts) {
+        value = val;
+        timestamp = ts;
+    }
+}
 
 public class CalorieHistory {
     private ReactContext mReactContext;
@@ -72,13 +83,22 @@ public class CalorieHistory {
 
         WritableArray map = Arguments.createArray();
 
+        // collects all recent basals
+        List<BMR> basals = new ArrayList<>();
+
+        try {
+            basals = getBasals();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
         //Used for aggregated data
         if (dataReadResult.getBuckets().size() > 0) {
             Log.i(TAG, "Number of buckets: " + dataReadResult.getBuckets().size());
             for (Bucket bucket : dataReadResult.getBuckets()) {
                 List<DataSet> dataSets = bucket.getDataSets();
                 for (DataSet dataSet : dataSets) {
-                    processDataSet(dataSet, map, basalCalculation);
+                    processDataSet(dataSet, map, basalCalculation, basals);
                 }
             }
         }
@@ -86,52 +106,14 @@ public class CalorieHistory {
         else if (dataReadResult.getDataSets().size() > 0) {
             Log.i(TAG, "Number of returned DataSets: " + dataReadResult.getDataSets().size());
             for (DataSet dataSet : dataReadResult.getDataSets()) {
-                processDataSet(dataSet, map, basalCalculation);
+                processDataSet(dataSet, map, basalCalculation, basals);
             }
         }
 
         return map;
     }
 
-
-    // utility function that gets the basal metabolic rate averaged over a week
-    private float getBasalAVG(long _et) throws Exception {
-        float basalAVG = 0;
-        Calendar cal = java.util.Calendar.getInstance();
-        cal.setTime(new Date(_et));
-        //set start time to a week before end time
-        cal.add(Calendar.WEEK_OF_YEAR, -1);
-        long nst = cal.getTimeInMillis();
-
-        DataReadRequest.Builder builder = new DataReadRequest.Builder();
-        builder.aggregate(DataType.TYPE_BASAL_METABOLIC_RATE, DataType.AGGREGATE_BASAL_METABOLIC_RATE_SUMMARY);
-        builder.bucketByTime(1, TimeUnit.DAYS);
-        builder.setTimeRange(nst, _et, TimeUnit.MILLISECONDS);
-        DataReadRequest readRequest = builder.build();
-
-        DataReadResult dataReadResult = Fitness.HistoryApi.readData(googleFitManager.getGoogleApiClient(), readRequest).await();
-
-        if (dataReadResult.getStatus().isSuccess()) {
-            JSONObject obj = new JSONObject();
-            int avgsN = 0;
-            for (Bucket bucket : dataReadResult.getBuckets()) {
-                // in the com.google.bmr.summary data type, each data point represents
-                // the average, maximum and minimum basal metabolic rate, in kcal per day, over the time interval of the data point.
-                DataSet ds = bucket.getDataSet(DataType.AGGREGATE_BASAL_METABOLIC_RATE_SUMMARY);
-                for (DataPoint dp : ds.getDataPoints()) {
-                    float avg = dp.getValue(Field.FIELD_AVERAGE).asFloat();
-                    basalAVG += avg;
-                    avgsN++;
-                }
-            }
-            // do the average of the averages
-            if (avgsN != 0) basalAVG /= avgsN; // this a daily average
-            return basalAVG;
-        } else throw new Exception(dataReadResult.getStatus().getStatusMessage());
-    }
-
-
-    private void processDataSet(DataSet dataSet, WritableArray map, boolean basalCalculation) {
+    private void processDataSet(DataSet dataSet, WritableArray map, boolean basalCalculation, List<BMR> basals) {
         Log.i(TAG, "Data returned for Data type: " + dataSet.getDataType().getName());
         DateFormat dateFormat = DateFormat.getDateInstance();
         DateFormat timeFormat = DateFormat.getTimeInstance();
@@ -155,18 +137,83 @@ public class CalorieHistory {
                 stepMap.putString("day", day);
                 stepMap.putDouble("startDate", dp.getStartTime(TimeUnit.MILLISECONDS));
                 stepMap.putDouble("endDate", dp.getEndTime(TimeUnit.MILLISECONDS));
-                float basal = 0;
-                if (basalCalculation) {
-                    try {
-                        basal = getBasalAVG(dp.getEndTime(TimeUnit.MILLISECONDS));
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
-                }
-                stepMap.putDouble("calorie", dp.getValue(field).asFloat() - basal);
+
+                float basal = getClosestBasal(dp.getEndTime(TimeUnit.MILLISECONDS), basals);
+                float valueWithoutBasal = dp.getValue(field).asFloat() - basal;
+                stepMap.putDouble("calorie", valueWithoutBasal < 0 ? 0 : valueWithoutBasal);
+                Log.i("TEST", "\tBasal: " + basal +
+                        " Calorie: " + valueWithoutBasal);
                 map.pushMap(stepMap);
             }
         }
+    }
+
+    // utility function that returns a correct basal for calolories depending on existing basals and the calories timestamp
+    private float getClosestBasal(long ts, List<BMR> basals) {
+        float basal = basals.size() > 0? basals.get(0).value : 0;
+
+        for (BMR bmr : basals) {
+            if (ts >= bmr.timestamp) {
+                return basal;
+            }
+
+            basal = bmr.value;
+        }
+
+        return basal;
+    }
+
+    // utility function that gets all recent basals
+    private List<BMR> getBasals() throws Exception {
+        List<BMR> basals = new ArrayList<>();
+        long et = new Date().getTime();
+
+        while(basals.size() == 0) {
+            Calendar cal = java.util.Calendar.getInstance();
+            cal.setTime(new Date(et));
+            cal.add(Calendar.MONTH, -1);
+            long nst = cal.getTimeInMillis();
+
+            DataReadRequest.Builder builder = new DataReadRequest.Builder();
+            builder.aggregate(DataType.TYPE_BASAL_METABOLIC_RATE, DataType.AGGREGATE_BASAL_METABOLIC_RATE_SUMMARY);
+            builder.bucketByTime(1, TimeUnit.DAYS);
+            builder.setTimeRange(nst, et, TimeUnit.MILLISECONDS);
+            DataReadRequest readRequest = builder.build();
+
+            DataReadResult dataReadResult = Fitness.HistoryApi.readData(googleFitManager.getGoogleApiClient(), readRequest).await();
+
+            if (dataReadResult.getStatus().isSuccess()) {
+                ArrayList<Bucket> buckets = (ArrayList<Bucket>) dataReadResult.getBuckets();
+
+                for (int i = buckets.size() - 1; i >= 0; i--) {
+                    DataSet ds = buckets.get(i).getDataSet(DataType.AGGREGATE_BASAL_METABOLIC_RATE_SUMMARY);
+
+                    if(ds != null) {
+                        int avgsN = 0;
+                        float basalAVG = 0;
+                        long ts = 0;
+
+                        for (DataPoint dp : ds.getDataPoints()) {
+                            float value = dp.getValue(Field.FIELD_AVERAGE).asFloat();
+
+                            if(value > 0) {
+                                ts = dp.getEndTime(TimeUnit.MILLISECONDS);
+                                basalAVG += value;
+                                avgsN++;
+                            }
+                        }
+
+                        if(basalAVG > 0) {
+                            basals.add(new BMR( basalAVG / avgsN, ts));
+                        }
+                    }
+                }
+
+                et = nst;
+            } else throw new Exception(dataReadResult.getStatus().getStatusMessage());
+        }
+
+        return basals;
     }
 
     public boolean saveFood(ReadableMap foodSample) {
